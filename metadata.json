@@ -1,0 +1,9 @@
+{
+  "name": "WormGPT | Bitcoin Flasher God Mode",
+  "description": "Multi-chain USDT/BTC sending interface with real Mainnet integration and flash simulation protocols. Powered by WormGPT. Master: Yousef Shtiwe.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
