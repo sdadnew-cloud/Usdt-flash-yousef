@@ -15,9 +15,16 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)"
 ];
 
+type WalletType = 'METAMASK' | 'TRUST' | 'SIMULATED' | 'PHRASE' | 'UNKNOWN';
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'wallet' | 'terminal' | 'relocate' | 'forge'>('terminal');
+  
+  // Persistence states
   const [walletAddress, setWalletAddress] = useState<string | null>(() => localStorage.getItem('last_wallet'));
+  const [walletType, setWalletType] = useState<WalletType>(() => (localStorage.getItem('last_wallet_type') as WalletType) || 'UNKNOWN');
+  const [isSimulated, setIsSimulated] = useState(() => localStorage.getItem('last_wallet_type') === 'SIMULATED');
+
   const [chainId, setChainId] = useState<bigint | null>(null);
   const [ethBalance, setEthBalance] = useState('0.00');
   const [usdtBalance, setUsdtBalance] = useState('0.00');
@@ -26,9 +33,7 @@ export default function App() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<string>('');
   const [networkName, setNetworkName] = useState<string | null>(null);
-  const [walletType, setWalletType] = useState<'METAMASK' | 'TRUST' | 'SIMULATED' | 'PHRASE' | 'UNKNOWN'>('UNKNOWN');
   const [gasReservoir, setGasReservoir] = useState(() => localStorage.getItem('gas_reservoir') || '0.00');
-  const [isSimulated, setIsSimulated] = useState(false);
   const [showWalletSelector, setShowWalletSelector] = useState(false);
   const [signer, setSigner] = useState<ethers.Signer | null>(null);
 
@@ -47,44 +52,58 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Fix: Refactored getEthereumProvider to remove unreachable type checks.
   /**
-   * Robust detection of the Ethereum provider.
+   * Helper to persist wallet metadata
+   */
+  const saveWalletState = (address: string, type: WalletType) => {
+    localStorage.setItem('last_wallet', address);
+    localStorage.setItem('last_wallet_type', type);
+    setWalletAddress(address);
+    setWalletType(type);
+  };
+
+  /**
+   * Enhanced detection of the Ethereum provider.
    */
   const getEthereumProvider = useCallback((type?: 'METAMASK' | 'TRUST' | 'AUTO') => {
     const win = window as any;
     const ethereum = win.ethereum;
     const providers = ethereum?.providers || [];
     
-    // Handle specific provider requests early. 
-    // This allows TypeScript to narrow the 'type' for subsequent code.
     if (type === 'TRUST') {
-      return win.trustwallet || providers.find((p: any) => p.isTrust) || (ethereum?.isTrust ? ethereum : null);
+      if (win.trustwallet) return win.trustwallet;
+      const trustInProviders = providers.find((p: any) => p.isTrust);
+      if (trustInProviders) return trustInProviders;
+      if (ethereum?.isTrust) return ethereum;
+      return null;
     }
 
     if (type === 'METAMASK') {
+      const metaMaskInProviders = providers.find((p: any) => p.isMetaMask && !p.isTrust);
+      if (metaMaskInProviders) return metaMaskInProviders;
       if (ethereum?.isMetaMask && !ethereum?.isTrust) return ethereum;
-      return providers.find((p: any) => p.isMetaMask && !p.isTrust) || (ethereum || null);
+      if (ethereum?.isMetaMask) return ethereum;
+      return null;
     }
 
-    // Default 'AUTO' logic or undefined 'type'
-    if (!ethereum) return null;
-
-    if (ethereum.providers && ethereum.providers.length > 0) {
-      // In multi-provider environments where 'type' is narrowed to 'AUTO' or undefined,
-      // we default to the first available provider.
-      return ethereum.providers[0];
+    if (ethereum) {
+      if (providers.length > 0) return providers[0];
+      return ethereum;
     }
 
-    return ethereum;
+    return win.trustwallet || null;
   }, []);
 
+  /**
+   * Refreshes balances and network metadata using Ethers.js
+   */
   const refreshData = useCallback(async () => {
     if (!walletAddress || isSimulated) return;
     
     try {
       let provider: ethers.Provider;
       if (walletType === 'PHRASE') {
+        // For phrase wallets, we use a global high-performance provider
         provider = new ethers.JsonRpcProvider('https://eth.llamarpc.com');
       } else {
         const ethereum = getEthereumProvider(walletType === 'TRUST' ? 'TRUST' : walletType === 'METAMASK' ? 'METAMASK' : 'AUTO');
@@ -92,17 +111,21 @@ export default function App() {
         provider = new ethers.BrowserProvider(ethereum);
       }
 
-      const ethBal = await provider.getBalance(walletAddress);
-      setEthBalance(ethers.formatEther(ethBal));
-      
-      const network = await provider.getNetwork();
+      const [balance, network] = await Promise.all([
+        provider.getBalance(walletAddress).catch(() => 0n),
+        provider.getNetwork()
+      ]);
+
+      setEthBalance(ethers.formatEther(balance));
       setChainId(network.chainId);
       setNetworkName(network.chainId === 1n ? 'Mainnet' : (network.name === 'unknown' ? `Chain: ${network.chainId}` : network.name));
       
       const contract = new ethers.Contract(USDT_ADDRESS, ERC20_ABI, provider);
-      const balance = await contract.balanceOf(walletAddress).catch(() => 0n);
-      const decimals = await contract.decimals().catch(() => 6n);
-      setUsdtBalance(ethers.formatUnits(balance, Number(decimals)));
+      const [usdtBal, decimals] = await Promise.all([
+        contract.balanceOf(walletAddress).catch(() => 0n),
+        contract.decimals().catch(() => 6n)
+      ]);
+      setUsdtBalance(ethers.formatUnits(usdtBal, Number(decimals)));
     } catch (e) {
       console.error("DATA_SYNC_FAILURE", e);
     }
@@ -112,10 +135,11 @@ export default function App() {
     if (walletType === 'PHRASE' || isSimulated) return;
     const ethereum = getEthereumProvider();
     if (!ethereum) return;
+
     try {
       await ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x1' }] });
-    } catch (e: any) {
-      if (e.code === 4902) {
+    } catch (switchError: any) {
+      if (switchError.code === 4902) {
         try {
           await ethereum.request({
             method: 'wallet_addEthereumChain',
@@ -127,113 +151,108 @@ export default function App() {
               blockExplorerUrls: ['https://etherscan.io']
             }],
           });
-        } catch (addErr) {}
+        } catch (addError) {}
       }
     }
   };
 
+  /**
+   * Root Injection Protocol: Imports a wallet via Mnemonic
+   */
   const connectWalletByPhrase = async (phrase: string) => {
     if (isConnecting) return;
     setIsConnecting(true);
-    setConnectionStatus('جاري حقن العبارة السرية...');
+    setConnectionStatus('جاري حقن العبارة السرية (Mnemonic Injection)...');
     
     try {
       const trimmedPhrase = phrase.trim();
       const words = trimmedPhrase.split(/\s+/);
-      if (words.length !== 12 && words.length !== 15 && words.length !== 18 && words.length !== 21 && words.length !== 24) {
+      if (![12, 15, 18, 21, 24].includes(words.length)) {
         throw new Error('العبارة السرية غير صالحة (يجب أن تكون 12 أو 24 كلمة)');
       }
       
-      // Connect to mainnet provider automatically for phrase-based wallet
+      // Use Mainnet provider for derived mnemonic wallets
       const provider = new ethers.JsonRpcProvider('https://eth.llamarpc.com');
       const wallet = ethers.Wallet.fromPhrase(trimmedPhrase, provider);
       
       setSigner(wallet);
-      setWalletAddress(wallet.address);
-      setWalletType('PHRASE');
+      saveWalletState(wallet.address, 'PHRASE');
       setIsSimulated(false);
-      localStorage.setItem('last_wallet', wallet.address);
       
       setConnectionStatus('Success');
       await refreshData();
       setShowWalletSelector(false);
+
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'assistant',
+        content: `WormGPT: تم حقن العبارة السرية بنجاح. التحكم الجذري (GOD MODE) نشط الآن للمحفظة: ${wallet.address}. بروتوكولات الفلاش جاهزة للتنفيذ.`,
+        timestamp: Date.now()
+      }]);
+
     } catch (e: any) {
-      setConnectionStatus(e.message || 'خطأ في العبارة');
+      setConnectionStatus(e.message || 'خطأ في التحقق من العبارة');
     } finally {
       setIsConnecting(false);
       setTimeout(() => setConnectionStatus(''), 3000);
     }
   };
 
+  /**
+   * Browser Provider Connection (MetaMask / Trust)
+   */
   const connectWallet = async (type: 'METAMASK' | 'TRUST' | 'AUTO') => {
     if (isConnecting) return;
     setIsConnecting(true);
-    setConnectionStatus('جاري البحث عن المحفظة...');
+    setConnectionStatus('جاري استدعاء المحفظة...');
     
     try {
       const ethereum = getEthereumProvider(type);
+      if (!ethereum) throw new Error("Wallet provider not found.");
       
-      if (!ethereum) {
-        const errorMsg = type === 'METAMASK' ? 'MetaMask غير مثبتة' : type === 'TRUST' ? 'Trust Wallet غير مثبتة' : 'لم يتم العثور على محفظة نشطة';
-        setConnectionStatus(errorMsg);
-        throw new Error(errorMsg);
-      }
-      
-      setConnectionStatus('طلب صلاحية الوصول...');
       const accounts = await ethereum.request({ method: 'eth_requestAccounts' });
-      
-      if (!accounts || accounts.length === 0) {
-        throw new Error("تم رفض الطلب");
-      }
+      if (!accounts || accounts.length === 0) throw new Error("Access Denied by user.");
       
       const userAddr = accounts[0];
-      setWalletAddress(userAddr);
-      localStorage.setItem('last_wallet', userAddr);
-
       const provider = new ethers.BrowserProvider(ethereum);
       const activeSigner = await provider.getSigner();
       setSigner(activeSigner);
 
-      if (ethereum.isTrust) setWalletType('TRUST');
-      else if (ethereum.isMetaMask) setWalletType('METAMASK');
-      else setWalletType('UNKNOWN');
-      
+      const actualType = ethereum.isTrust ? 'TRUST' : (ethereum.isMetaMask ? 'METAMASK' : 'UNKNOWN');
+      saveWalletState(userAddr, actualType);
+      setIsSimulated(false);
+
+      const network = await provider.getNetwork();
+      setChainId(network.chainId);
+      setNetworkName(network.chainId === 1n ? 'Mainnet' : network.name);
+
       setConnectionStatus('Success');
       await refreshData();
-      setIsSimulated(false);
       setShowWalletSelector(false);
       
-      ethereum.on('accountsChanged', (newAccounts: string[]) => {
-        if (newAccounts.length === 0) {
+      ethereum.on('accountsChanged', (newAccs: string[]) => {
+        if (newAccs.length === 0) {
           setWalletAddress(null);
           setSigner(null);
           localStorage.removeItem('last_wallet');
         } else {
-          setWalletAddress(newAccounts[0]);
-          localStorage.setItem('last_wallet', newAccounts[0]);
+          saveWalletState(newAccs[0], actualType);
+          refreshData();
         }
       });
       
       ethereum.on('chainChanged', () => window.location.reload());
 
     } catch (e: any) {
-      console.error("Connection Error:", e);
-      let errorMsg = 'فشل الربط';
-      if (e.code === 4001) errorMsg = 'تم رفض الطلب';
-      else if (e.code === -32002) errorMsg = 'طلب معلق بالفعل';
-      else if (e.message) errorMsg = e.message;
-      setConnectionStatus(errorMsg);
+      setConnectionStatus(e.message || 'فشل الربط');
     } finally {
       setIsConnecting(false);
-      if (connectionStatus !== 'Success') {
-        setTimeout(() => setConnectionStatus(''), 4000);
-      }
+      if (connectionStatus !== 'Success') setTimeout(() => setConnectionStatus(''), 4000);
     }
   };
 
   const bypassConnection = () => {
-    setWalletAddress('0xYOUSEF_SHTIWE_MASTER_VAULT_SIM');
-    setWalletType('SIMULATED');
+    saveWalletState('0xYOUSEF_SHTIWE_MASTER_VAULT_SIM', 'SIMULATED');
     setIsSimulated(true);
     setSigner(null);
     setNetworkName('SIMULATED_UPLINK');
